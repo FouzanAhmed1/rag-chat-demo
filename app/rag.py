@@ -1,14 +1,18 @@
 """Retrieval + answer generation.
 
-- retrieve(): embed the question, search the store, apply the score floor.
+- retrieve(): hybrid retrieval (vector cosine + BM25, RRF fusion, rerank).
 - fake_answer(): offline extractive answer with citations (FAKE_LLM=1).
-- llm_answer(): real answer via an OpenAI-compatible chat endpoint.
+- fake_answer_stream(): the same answer, yielded word by word for SSE.
+- llm_answer() / llm_answer_stream(): real answers via an OpenAI-compatible
+  chat endpoint; see StreamingLLM for the interface a streaming backend
+  must implement.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, Protocol
 
 from app import config
 from app.chunking import split_sentences
@@ -108,6 +112,37 @@ def retrieve_debug(
     return hits, contributions, debug
 
 
+def _build_citations(
+    hits: list[tuple[Chunk, float]],
+    contributions: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the citation dicts shared by every answer path."""
+    citations = []
+    for i, ((chunk, score), contrib) in enumerate(
+        zip(hits, contributions or [{}] * len(hits)), start=1
+    ):
+        citations.append(
+            {
+                "ref": i,
+                "source": chunk.source,
+                "page": chunk.page,
+                "score": round(score, 3),
+                "excerpt": chunk.text[:300].strip(),
+                "rankers": _contributing_rankers(contrib),
+            }
+        )
+    return citations
+
+
+def _build_context_blocks(hits: list[tuple[Chunk, float]]) -> list[str]:
+    return [
+        f"[{i}] {chunk.source}"
+        + (f" (page {chunk.page})" if chunk.page else "")
+        + f"\n{chunk.text}"
+        for i, (chunk, _) in enumerate(hits, start=1)
+    ]
+
+
 def _best_sentences(chunk_text: str, keywords: list[str], limit: int = 2) -> list[str]:
     scored: list[tuple[int, str]] = []
     for sentence in split_sentences(chunk_text):
@@ -164,20 +199,7 @@ def fake_answer(
         # Fall back to the start of the best chunk if no sentence matched.
         picked = [(hits[0][0].text[:400].strip(), 1)]
 
-    citations = []
-    for i, ((chunk, score), contrib) in enumerate(
-        zip(hits, contributions or [{}] * len(hits))
-    ):
-        citations.append(
-            {
-                "ref": i + 1,
-                "source": chunk.source,
-                "page": chunk.page,
-                "score": round(score, 3),
-                "excerpt": chunk.text[:300].strip(),
-                "rankers": _contributing_rankers(contrib),
-            }
-        )
+    citations = _build_citations(hits, contributions)
     lines = ["Here is what I found in your documents:"]
     for sentence, ref in picked[:3]:
         lines.append(f"- {sentence} [{ref}]")
@@ -210,23 +232,8 @@ def llm_answer(
     if not config.LLM_API_KEY:
         raise ValueError("LLM_API_KEY is required when FAKE_LLM is not 1")
 
-    context_blocks = []
-    citations = []
-    for i, ((chunk, score), contrib) in enumerate(
-        zip(hits, contributions or [{}] * len(hits)), start=1
-    ):
-        label = chunk.source + (f" (page {chunk.page})" if chunk.page else "")
-        context_blocks.append(f"[{i}] {label}\n{chunk.text}")
-        citations.append(
-            {
-                "ref": i,
-                "source": chunk.source,
-                "page": chunk.page,
-                "score": round(score, 3),
-                "excerpt": chunk.text[:300].strip(),
-                "rankers": _contributing_rankers(contrib),
-            }
-        )
+    context_blocks = _build_context_blocks(hits)
+    citations = _build_citations(hits, contributions)
 
     if not hits:
         return {
@@ -270,6 +277,39 @@ def llm_answer(
     }
 
 
+def _prepare(
+    question: str,
+    store: VectorStore,
+    embedder: Embedder,
+    top_k: int | None = None,
+    alpha: float | None = None,
+    reranker: str | None = None,
+    history: list[Turn] | None = None,
+    session_id: str | None = None,
+) -> tuple[
+    list[tuple[Chunk, float]], list[dict[str, Any]], dict[str, Any], list[Turn]
+]:
+    """Shared retrieval + debug prep for the answer and stream paths."""
+    history = history or []
+    retrieval_query = rewrite_query(question, history)
+    hits, contributions, debug = retrieve_debug(
+        retrieval_query,
+        store,
+        embedder,
+        top_k=top_k,
+        alpha=alpha,
+        reranker=reranker,
+    )
+    debug["retrieval_query"] = retrieval_query
+    debug["history_turns_used"] = len(history)
+    debug["session_id"] = session_id
+    debug["contributions"] = [
+        {"ref": i + 1, "source": chunk.source, **contrib}
+        for i, ((chunk, _), contrib) in enumerate(zip(hits, contributions))
+    ]
+    return hits, contributions, debug, history
+
+
 def answer_question(
     question: str,
     store: VectorStore,
@@ -280,19 +320,16 @@ def answer_question(
     history: list[Turn] | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    history = history or []
-    retrieval_query = rewrite_query(question, history)
-    hits, contributions, debug = retrieve_debug(
-        retrieval_query, store, embedder, top_k=top_k, alpha=alpha,
+    hits, contributions, debug, history = _prepare(
+        question,
+        store,
+        embedder,
+        top_k=top_k,
+        alpha=alpha,
         reranker=reranker,
+        history=history,
+        session_id=session_id,
     )
-    debug["retrieval_query"] = retrieval_query
-    debug["history_turns_used"] = len(history)
-    debug["session_id"] = session_id
-    debug["contributions"] = [
-        {"ref": i + 1, "source": chunk.source, **contrib}
-        for i, ((chunk, _), contrib) in enumerate(zip(hits, contributions))
-    ]
     if config.FAKE_LLM:
         return fake_answer(
             question,
@@ -308,3 +345,154 @@ def answer_question(
         retrieval_debug=debug,
         history=history,
     )
+
+
+class StreamingLLM(Protocol):
+    """Interface a real streaming LLM backend must implement.
+
+    A streaming backend receives the user question, the retrieved context
+    blocks (already formatted as "[1] source\\ntext"), and the conversation
+    history, and yields the answer as text tokens (words, subwords, or
+    whatever the model emits) in generation order. The /chat/stream
+    endpoint wraps each token in an SSE ``data: {"token": ...}`` event and
+    terminates the stream with ``data: [DONE]``.
+
+    A minimal OpenAI-compatible implementation ships below as
+    llm_answer_stream(); plug in your own by passing it as the
+    ``llm_streamer`` argument to stream_answer().
+    """
+
+    def stream_answer(
+        self,
+        question: str,
+        context_blocks: list[str],
+        history: list[Turn],
+    ) -> Iterator[str]:
+        """Yield answer tokens in generation order."""
+        ...
+
+
+def fake_answer_stream(
+    question: str,
+    hits: list[tuple[Chunk, float]],
+    contributions: list[dict[str, Any]] | None = None,
+    retrieval_debug: dict[str, Any] | None = None,
+    history: list[Turn] | None = None,
+) -> Iterator[str]:
+    """Yield the fake extractive answer word by word.
+
+    Joining the tokens reproduces fake_answer()["answer"] exactly, so the
+    streaming and non-streaming paths can never disagree.
+    """
+    result = fake_answer(
+        question,
+        hits,
+        contributions=contributions,
+        retrieval_debug=retrieval_debug,
+        history=history,
+    )
+    for token in re.findall(r"\S+\s*", result["answer"]):
+        yield token
+
+
+def llm_answer_stream(
+    question: str,
+    hits: list[tuple[Chunk, float]],
+    history: list[Turn] | None = None,
+) -> Iterator[str]:
+    """Stream tokens from an OpenAI-compatible chat completions endpoint."""
+    import json as jsonlib
+
+    import httpx
+
+    if not config.LLM_API_KEY:
+        raise ValueError("LLM_API_KEY is required when FAKE_LLM is not 1")
+
+    if not hits:
+        yield (
+            "I could not find anything relevant in the indexed documents. "
+            "Try rephrasing your question or ingest more documents."
+        )
+        return
+
+    context = "\n\n".join(_build_context_blocks(hits))
+    system = (
+        "You answer questions using ONLY the context below. "
+        "Cite your sources with bracketed numbers like [1], [2] matching the "
+        "context blocks. If the context does not contain the answer, say so."
+    )
+    history_block = history_prompt_block(history or [])
+    user_content = f"Context:\n{context}\n\nQuestion: {question}"
+    if history_block:
+        user_content = f"{history_block}\n\n{user_content}"
+
+    with httpx.stream(
+        "POST",
+        f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
+        json={
+            "model": config.LLM_MODEL,
+            "temperature": 0.2,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        },
+        timeout=120.0,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                delta = jsonlib.loads(payload)["choices"][0]["delta"].get(
+                    "content"
+                )
+            except (KeyError, ValueError):
+                continue
+            if delta:
+                yield delta
+
+
+def stream_answer(
+    question: str,
+    store: VectorStore,
+    embedder: Embedder,
+    top_k: int | None = None,
+    alpha: float | None = None,
+    reranker: str | None = None,
+    history: list[Turn] | None = None,
+    session_id: str | None = None,
+    llm_streamer: StreamingLLM | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], Iterator[str]]:
+    """Prepare a streaming answer.
+
+    Returns (citations, debug, token_iterator). The caller wraps tokens in
+    SSE events; joining the tokens gives the full answer text.
+    """
+    hits, contributions, debug, history = _prepare(
+        question,
+        store,
+        embedder,
+        top_k=top_k,
+        alpha=alpha,
+        reranker=reranker,
+        history=history,
+        session_id=session_id,
+    )
+    citations = _build_citations(hits, contributions)
+    if config.FAKE_LLM:
+        tokens = fake_answer_stream(
+            question, hits, contributions, debug, history
+        )
+    elif llm_streamer is not None:
+        tokens = llm_streamer.stream_answer(
+            question, _build_context_blocks(hits), history
+        )
+    else:
+        tokens = llm_answer_stream(question, hits, history)
+    return citations, debug, tokens

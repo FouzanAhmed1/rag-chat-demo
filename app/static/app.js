@@ -47,6 +47,95 @@ async function refreshStatus() {
   }
 }
 
+function getSessionId() {
+  let id = null;
+  try {
+    id = localStorage.getItem("rag_session_id");
+  } catch (e) {
+    /* storage unavailable, fall through */
+  }
+  if (!id) {
+    id =
+      (window.crypto && crypto.randomUUID
+        ? crypto.randomUUID()
+        : "sess-" + Date.now().toString(36) + Math.random().toString(36).slice(2));
+    try {
+      localStorage.setItem("rag_session_id", id);
+    } catch (e) {
+      /* storage unavailable */
+    }
+  }
+  return id;
+}
+
+// Stream an answer from POST /chat/stream, rendering tokens as they arrive.
+// Throws if the stream is unusable so the caller can fall back to /chat.
+async function askStream(question, botDiv) {
+  const res = await fetch("/chat/stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Id": getSessionId(),
+    },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok || !res.body) {
+    throw new Error("stream unavailable (HTTP " + res.status + ")");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let gotDone = false;
+  let citations = null;
+  botDiv.classList.remove("typing");
+  botDiv.textContent = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop();
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "[DONE]") {
+        gotDone = true;
+        break;
+      }
+      let evt;
+      try {
+        evt = JSON.parse(payload);
+      } catch (e) {
+        throw new Error("could not parse stream event");
+      }
+      if (evt.error) throw new Error(evt.error);
+      if (evt.token) botDiv.textContent += evt.token;
+      if (evt.citations) citations = evt.citations;
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+    if (gotDone) break;
+  }
+  if (!gotDone) throw new Error("stream ended without [DONE]");
+  return citations;
+}
+
+async function askOnce(question, botDiv) {
+  const res = await fetch("/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Session-Id": getSessionId(),
+    },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  botDiv.classList.remove("typing");
+  botDiv.textContent = data.answer;
+  return data.citations;
+}
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const question = input.value.trim();
@@ -56,17 +145,16 @@ form.addEventListener("submit", async (e) => {
   addMessage(question, "user");
   const typing = addMessage("thinking...", "bot typing");
   try {
-    const res = await fetch("/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
-    });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const data = await res.json();
-    typing.classList.remove("typing");
-    typing.textContent = data.answer;
-    addCitations(typing, data.citations);
+    let citations;
+    try {
+      citations = await askStream(question, typing);
+    } catch (streamErr) {
+      // Graceful fallback: the plain non-streaming endpoint.
+      citations = await askOnce(question, typing);
+    }
+    addCitations(typing, citations);
   } catch (err) {
+    typing.classList.remove("typing");
     typing.textContent = "Error: " + err.message;
   } finally {
     sendBtn.disabled = false;

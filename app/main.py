@@ -14,6 +14,7 @@ SAMPLE_DOCS_DIR are auto-ingested.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -27,7 +28,7 @@ from app import config
 from app.chunking import chunk_text
 from app.embeddings import build_embedder
 from app.ingest import SUPPORTED_SUFFIXES, doc_id_for, load_document
-from app.rag import answer_question
+from app.rag import answer_question, stream_answer
 from app.sessions import sessions
 from app.store import Chunk, VectorStore
 
@@ -166,6 +167,49 @@ def chat(
     if session_id:
         sessions.record(session_id, req.question, result["answer"])
     return result
+
+
+@app.post("/chat/stream")
+def chat_stream(
+    req: ChatRequest, x_session_id: str | None = Header(default=None)
+) -> StreamingResponse:
+    """SSE answer stream.
+
+    Emits one event carrying citations + debug info, then one
+    ``data: {"token": ...}`` event per token as it is generated, and
+    finishes with ``data: [DONE]``. A mid-stream failure emits
+    ``data: {"error": ...}`` instead of [DONE]; the UI falls back to the
+    non-streaming /chat endpoint in that case.
+    """
+    session_id = req.session_id or x_session_id
+    history = sessions.history(session_id) if session_id else []
+    try:
+        citations, debug, tokens = stream_answer(
+            req.question,
+            store,
+            embedder,
+            top_k=req.top_k,
+            history=history,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    def gen():
+        yield "data: " + json.dumps({"citations": citations, "debug": debug}) + "\n\n"
+        collected: list[str] = []
+        try:
+            for tok in tokens:
+                collected.append(tok)
+                yield "data: " + json.dumps({"token": tok}) + "\n\n"
+        except Exception as exc:
+            yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+            return
+        if session_id:
+            sessions.record(session_id, req.question, "".join(collected))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.delete("/index")
