@@ -14,6 +14,7 @@ from app import config
 from app.chunking import split_sentences
 from app.embeddings import Embedder
 from app.hybrid import hybrid_retrieve
+from app.rerank import get_reranker
 from app.store import Chunk, VectorStore
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -36,10 +37,17 @@ def retrieve(
     top_k: int | None = None,
     min_score: float | None = None,
     alpha: float | None = None,
+    reranker: str | None = None,
 ) -> list[tuple[Chunk, float]]:
     """Hybrid retrieval: vector cosine + BM25 fused with weighted RRF."""
     hits, _, _ = retrieve_debug(
-        question, store, embedder, top_k=top_k, min_score=min_score, alpha=alpha
+        question,
+        store,
+        embedder,
+        top_k=top_k,
+        min_score=min_score,
+        alpha=alpha,
+        reranker=reranker,
     )
     return hits
 
@@ -51,6 +59,7 @@ def retrieve_debug(
     top_k: int | None = None,
     min_score: float | None = None,
     alpha: float | None = None,
+    reranker: str | None = None,
 ) -> tuple[list[tuple[Chunk, float]], list[dict[str, Any]], dict[str, Any]]:
     """Like retrieve(), but also returns per-hit ranker contributions and
     a debug dict describing how the ranking was produced."""
@@ -74,9 +83,24 @@ def retrieve_debug(
         rrf_k=config.RRF_K,
         min_score=min_score,
     )
+
+    # Optional rerank stage after fusion; contributions are re-aligned to
+    # the reranked order by chunk id. An explicit reranker name overrides
+    # the RERANKER env var (handy for tests).
+    if reranker is None:
+        reranker = config.RERANKER
+    if hits and reranker != "none":
+        contrib_by_id = {
+            chunk.id: contrib for (chunk, _), contrib in zip(hits, contributions)
+        }
+        reranked = get_reranker(reranker).rerank(question, hits)
+        contributions = [contrib_by_id[chunk.id] for chunk, _ in reranked]
+        hits = reranked
+
     debug = {
         "hybrid_alpha": alpha,
         "rrf_k": config.RRF_K,
+        "reranker": reranker,
         "vector_pool_size": len(vector_hits),
     }
     return hits, contributions, debug

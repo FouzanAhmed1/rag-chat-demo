@@ -69,7 +69,7 @@ def test_fusion_differs_from_pure_vector(synth):
     pure_vector = _order(
         store.search(embedder.embed([QUERY])[0], top_k=4, min_score=0.0)
     )
-    fused = _order(retrieve(QUERY, store, embedder, alpha=0.5))
+    fused = _order(retrieve(QUERY, store, embedder, alpha=0.5, reranker="none"))
     assert pure_vector == ["chunk-a.txt", "chunk-c.txt", "chunk-b.txt"]
     assert fused == ["chunk-a.txt", "chunk-b.txt", "chunk-c.txt"]
     assert fused != pure_vector
@@ -80,13 +80,13 @@ def test_alpha_one_reproduces_pure_vector(synth):
     pure_vector = _order(
         store.search(embedder.embed([QUERY])[0], top_k=4, min_score=0.0)
     )
-    fused = _order(retrieve(QUERY, store, embedder, alpha=1.0))
+    fused = _order(retrieve(QUERY, store, embedder, alpha=1.0, reranker="none"))
     assert fused == pure_vector
 
 
 def test_alpha_zero_reproduces_pure_bm25(synth):
     store, embedder = synth
     bm25_order = [store.chunks[i].source for i, _ in BM25(store.chunks).ranked(QUERY)]
-    fused = _order(retrieve(QUERY, store, embedder, alpha=0.0))
+    fused = _order(retrieve(QUERY, store, embedder, alpha=0.0, reranker="none"))
     assert bm25_order == ["chunk-b.txt", "chunk-a.txt", "chunk-c.txt"]
     assert fused == bm25_order
