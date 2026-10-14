@@ -1,0 +1,19 @@
+Meridian Outdoors - Information Security Policy (summary)
+
+1. Two-factor authentication (2FA) is required on every work account,
+   including email, VPN, code hosting, and the HR portal. Use an
+   authenticator app; SMS codes are allowed only as a backup.
+
+2. Never share your password with anyone, including IT staff. IT will never
+   ask for your password by email, chat, or phone.
+
+3. Report phishing emails with the "Report phishing" button in your mail
+   client, or forward them to security@meridianoutdoors.example. Do not
+   click links or open attachments in suspicious messages.
+
+4. Lock your laptop (Win+L or Ctrl+Cmd+Q) whenever you step away. Full-disk
+   encryption must stay enabled on all company devices.
+
+5. If you suspect a security incident, such as a lost laptop or a breached
+   account, notify security@meridianoutdoors.example immediately, then open
+   a P1 ticket in the IT system.
