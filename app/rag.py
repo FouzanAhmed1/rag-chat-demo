@@ -65,14 +65,15 @@ def fake_answer(
             "citations": [],
         }
     keywords = _keywords(question)
-    picked: list[str] = []
-    for chunk, _ in hits[:2]:
-        picked.extend(_best_sentences(chunk.text, keywords, limit=2))
+    picked: list[tuple[str, int]] = []  # (sentence, citation ref)
+    for ref, (chunk, _) in enumerate(hits[:2], start=1):
+        for sentence in _best_sentences(chunk.text, keywords, limit=2):
+            picked.append((sentence, ref))
         if len(picked) >= 3:
             break
     if not picked:
         # Fall back to the start of the best chunk if no sentence matched.
-        picked = [hits[0][0].text[:400].strip()]
+        picked = [(hits[0][0].text[:400].strip(), 1)]
 
     citations = [
         {
@@ -85,8 +86,8 @@ def fake_answer(
         for i, (chunk, score) in enumerate(hits)
     ]
     lines = ["Here is what I found in your documents:"]
-    for i, sentence in enumerate(picked[:3], start=1):
-        lines.append(f"- {sentence} [{i if i <= len(citations) else 1}]")
+    for sentence, ref in picked[:3]:
+        lines.append(f"- {sentence} [{ref}]")
     lines.append("")
     lines.append(
         "Sources: "
