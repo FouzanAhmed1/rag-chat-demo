@@ -26,13 +26,24 @@ ingest  ->  chunk  ->  embed  ->  retrieve  ->  answer
    `HashingEmbedder`, an offline TF-style embedder with MD5 feature hashing.
    Optional backends: any OpenAI-compatible embeddings endpoint, or
    sentence-transformers behind a flag.
-4. **Retrieve** (`app/store.py`, `app/rag.py`): numpy brute-force cosine
-   similarity, top-k with a minimum score floor. The index persists to
-   `./data/index.npz` + `index.json` and reloads on startup. No vector DB.
+4. **Retrieve** (`app/store.py`, `app/hybrid.py`, `app/rerank.py`, `app/rag.py`):
+   hybrid retrieval fuses numpy brute-force cosine similarity with a
+   dependency-free BM25 keyword ranker via weighted reciprocal rank fusion
+   (`HYBRID_ALPHA`: 0.0 = pure BM25, 1.0 = pure vector, 0.5 = even blend).
+   An optional rerank stage (`RERANKER=heuristic` by default, `none` to
+   skip) reorders the fused hits with cheap deterministic signals. The
+   index persists to `./data/index.npz` + `index.json` and reloads on
+   startup. No vector DB.
 5. **Answer** (`app/rag.py`): with `FAKE_LLM=1` (the default) answers are
    extractive, quoting the best-matching sentences with `[n]` citations. Set
    `FAKE_LLM=0` plus `LLM_API_KEY` to get real generated answers from any
-   OpenAI-compatible chat endpoint.
+   OpenAI-compatible chat endpoint. `POST /chat/stream` streams the same
+   answers token by token over server-sent events.
+6. **Converse** (`app/sessions.py`): the UI keeps a session id (sent as the
+   `X-Session-Id` header), and the server remembers the last
+   `SESSION_MAX_TURNS` turns per session so follow-ups like "what about the
+   VPN?" inherit the topic of earlier questions. Idle sessions expire after
+   `SESSION_TTL_SECONDS`.
 
 The web UI (`app/static/`) is plain HTML and JS, no framework and no CDN,
 served by FastAPI at `/`.
@@ -110,6 +121,110 @@ Clear the index and re-ingest:
 curl -X DELETE http://localhost:8000/index
 ```
 
+### Streaming answers
+
+`POST /chat/stream` accepts the same body as `/chat` and returns
+`text/event-stream`. The first event carries citations and debug info, then
+one `data: {"token": "..."}` event arrives per token, and the stream ends
+with `data: [DONE]`:
+
+```bash
+curl -N -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question": "How do I reset my password?"}'
+# data: {"citations": [...], "debug": {...}}
+# data: {"token": "Here "}
+# data: {"token": "is "}
+# ...
+# data: [DONE]
+```
+
+If a token generator fails mid-stream you get `data: {"error": "..."}`
+instead of `[DONE]`; the web UI falls back to the non-streaming `/chat`
+endpoint in that case.
+
+The offline fake LLM streams the extractive answer word by word. A real
+streaming backend must implement the `StreamingLLM` interface in
+`app/rag.py`: a `stream_answer(question, context_blocks, history)` method
+that yields tokens in generation order. The default real backend
+(`llm_answer_stream`) does this against any OpenAI-compatible
+`/chat/completions` endpoint with `"stream": true`.
+
+### Hybrid retrieval
+
+Every question is scored twice: cosine similarity from the embedder and
+BM25 keyword scores from a small built-in implementation (no extra
+dependencies). The two rankings are fused with reciprocal rank fusion,
+`score = sum(weight / (RRF_K + rank))` with `RRF_K=60`:
+
+```bash
+# Pure BM25 (great for exact rare-term matches)
+HYBRID_ALPHA=0 uvicorn app.main:app
+# Even blend (default)
+HYBRID_ALPHA=0.5 uvicorn app.main:app
+# Pure vector
+HYBRID_ALPHA=1 uvicorn app.main:app
+```
+
+Each citation in the response lists the `rankers` that surfaced it, and the
+`debug` payload shows the per-ranker ranks and raw scores plus the alpha
+that was used, so you can see exactly why a chunk won.
+
+### Multi-turn conversation
+
+Send an `X-Session-Id` header (or a `session_id` field in the JSON body)
+and the server keeps your last few turns. Follow-up questions are answered
+with the conversation history in the prompt, and retrieval uses a query
+rewritten from your recent questions, so "how long does that take?" works
+right after "what is the return policy?":
+
+```bash
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" -H "X-Session-Id: demo-1" \
+  -d '{"question": "What is the return policy?"}'
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" -H "X-Session-Id: demo-1" \
+  -d '{"question": "How long does that take?"}'
+```
+
+Sessions are in-memory only (a restart clears them) and expire after
+`SESSION_TTL_SECONDS` of inactivity. The `debug` block in each response
+reports `history_turns_used` and the `retrieval_query` that was actually
+searched.
+
+### Reranking
+
+After fusion, an optional rerank stage reorders the hits. The default
+`RERANKER=heuristic` is a deterministic, LLM-free scorer combining
+query-term coverage, markdown heading matches, a small position bonus for
+early-document chunks, and a length penalty for very long chunks. Set
+`RERANKER=none` to keep the raw fusion order.
+
+To plug in a real cross-encoder (e.g. from sentence-transformers),
+implement the `Reranker` interface and register it at startup:
+
+```python
+from app.rerank import Reranker, set_reranker
+
+class CrossEncoderReranker(Reranker):
+    def __init__(self):
+        from sentence_transformers import CrossEncoder
+        self.model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    def rerank(self, query, hits):
+        # hits: list of (chunk, score); return them reordered
+        pairs = [(query, chunk.text) for chunk, _ in hits]
+        scores = self.model.predict(pairs)
+        ranked = sorted(zip(hits, scores), key=lambda p: p[1], reverse=True)
+        return [hit for hit, _ in ranked]
+
+# in app/main.py, or any startup hook:
+set_reranker(CrossEncoderReranker())
+```
+
+The interface contract is just `rerank(query, hits) -> hits`: same
+`(chunk, score)` tuples, best first, deterministic for the same inputs.
+
 ## Config / env reference
 
 All settings come from environment variables; see `.env.example` for the full
@@ -121,6 +236,11 @@ annotated list. The important ones:
 | `CHUNK_OVERLAP` | 120 | Overlap characters carried into the next chunk |
 | `TOP_K` | 4 | Chunks retrieved per question |
 | `MIN_SCORE` | 0.05 | Minimum cosine similarity to count as relevant |
+| `HYBRID_ALPHA` | 0.5 | Retrieval blend: 0.0 = pure BM25, 1.0 = pure vector |
+| `RRF_K` | 60 | Reciprocal rank fusion constant |
+| `RERANKER` | heuristic | Rerank stage: `heuristic` or `none` |
+| `SESSION_MAX_TURNS` | 6 | Conversation turns kept per session |
+| `SESSION_TTL_SECONDS` | 1800 | Idle seconds before a session expires |
 | `EMBED_PROVIDER` | hash | `hash` (offline), `openai`, or `sentence-transformers` |
 | `EMBED_DIM` | 1024 | Vector dim for the hash embedder |
 | `EMBED_API_KEY` / `EMBED_BASE_URL` / `EMBED_MODEL` | - | OpenAI-compatible embeddings endpoint |
@@ -143,8 +263,13 @@ pytest
 
 The suite covers chunking (overlap behavior, size limits, edge cases),
 retrieval ranking (each sample-doc query returns the expected document top-1,
-junk queries are filtered), and the API (`/health`, `/documents`, `/ingest`
-upload and rejection, `/chat` with citations, the UI at `/`). Everything runs
+junk queries are filtered), hybrid fusion (a synthetic corpus where BM25
+outranks vector; alpha 1.0/0.0 reproduce the pure rankings), the heuristic
+reranker (term-coverage promotion, determinism, `none` preserves fusion
+order), multi-turn sessions (history accumulation, TTL expiry, per-session
+isolation), SSE streaming (ordered token events, `[DONE]`, stream equals
+non-stream answer), and the API (`/health`, `/documents`, `/ingest` upload
+and rejection, `/chat` with citations, the UI at `/`). Everything runs
 offline: `FAKE_LLM=1` and the hash embedder are forced in tests.
 
 ## Deploy
@@ -187,9 +312,14 @@ rag-chat-demo/
     chunking.py    sentence-aware chunking with overlap
     embeddings.py  swappable embedders (hash default, openai, sentence-transformers)
     store.py       numpy cosine-similarity vector store, persisted to disk
+    hybrid.py      dependency-free BM25 + weighted reciprocal rank fusion
+    rerank.py      Reranker interface + heuristic reranker (plug in a
+                   cross-encoder via set_reranker())
+    sessions.py    per-session in-memory conversation history with TTL
     ingest.py      PDF / txt / md loading
-    rag.py         retrieval, extractive fake-LLM answers, real LLM answers
-    static/        single-page chat UI (plain HTML/JS)
+    rag.py         retrieval, extractive fake-LLM answers, real LLM answers,
+                   SSE token streaming (StreamingLLM interface)
+    static/        single-page chat UI (plain HTML/JS, streams tokens)
   sample_docs/     fictional Meridian Outdoors docs, indexed on startup
   tests/           pytest suite (offline)
   Dockerfile       one-command container build

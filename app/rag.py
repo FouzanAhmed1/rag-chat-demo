@@ -155,13 +155,19 @@ def _best_sentences(chunk_text: str, keywords: list[str], limit: int = 2) -> lis
 
 
 def _contributing_rankers(contribution: dict[str, Any] | None) -> list[str]:
-    """Which rankers surfaced a hit (used in the debug response)."""
+    """Which rankers surfaced a hit and carried weight in the fusion."""
     if not contribution:
         return []
     names = []
-    if contribution.get("vector_rank") is not None:
+    if (
+        contribution.get("vector_rank") is not None
+        and (contribution.get("vector_weight") or 0) > 0
+    ):
         names.append("vector")
-    if contribution.get("bm25_rank") is not None:
+    if (
+        contribution.get("bm25_rank") is not None
+        and (contribution.get("bm25_weight") or 0) > 0
+    ):
         names.append("bm25")
     return names
 

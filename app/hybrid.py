@@ -149,6 +149,8 @@ def hybrid_retrieve(
                 "vector_score": round(vs, 4),
                 "bm25_score": round(bs, 4),
                 "fused_score": round(fused_score, 5),
+                "vector_weight": alpha,
+                "bm25_weight": round(1.0 - alpha, 4),
             }
         )
     return hits, contributions

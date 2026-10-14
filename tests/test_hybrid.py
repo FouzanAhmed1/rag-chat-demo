@@ -90,3 +90,24 @@ def test_alpha_zero_reproduces_pure_bm25(synth):
     fused = _order(retrieve(QUERY, store, embedder, alpha=0.0, reranker="none"))
     assert bm25_order == ["chunk-b.txt", "chunk-a.txt", "chunk-c.txt"]
     assert fused == bm25_order
+
+
+def test_contributors_reflect_zero_weight_ranker(synth):
+    from app.rag import answer_question
+
+    store, embedder = synth
+    bm25_only = answer_question(
+        QUERY, store, embedder, alpha=0.0, reranker="none"
+    )
+    assert bm25_only["citations"]
+    for cite in bm25_only["citations"]:
+        assert "vector" not in cite["rankers"]
+        assert "bm25" in cite["rankers"]
+
+    vector_only = answer_question(
+        QUERY, store, embedder, alpha=1.0, reranker="none"
+    )
+    assert vector_only["citations"]
+    for cite in vector_only["citations"]:
+        assert "bm25" not in cite["rankers"]
+        assert "vector" in cite["rankers"]
