@@ -32,7 +32,7 @@ TOP_K: int = _get_int("TOP_K", 4)
 MIN_SCORE: float = _get_float("MIN_SCORE", 0.05)
 
 # Offline hashing embedder
-EMBED_DIM: int = _get_int("EMBED_DIM", 256)
+EMBED_DIM: int = _get_int("EMBED_DIM", 1024)
 # "hash" (default, offline), "openai" (OpenAI-compatible embeddings endpoint),
 # "sentence-transformers" (needs USE_SENTENCE_TRANSFORMERS=1 and the extra dep)
 EMBED_PROVIDER: str = os.environ.get("EMBED_PROVIDER", "hash").lower()
