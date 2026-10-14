@@ -13,6 +13,7 @@ from typing import Any
 from app import config
 from app.chunking import split_sentences
 from app.embeddings import Embedder
+from app.hybrid import hybrid_retrieve
 from app.store import Chunk, VectorStore
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -34,11 +35,51 @@ def retrieve(
     embedder: Embedder,
     top_k: int | None = None,
     min_score: float | None = None,
+    alpha: float | None = None,
 ) -> list[tuple[Chunk, float]]:
+    """Hybrid retrieval: vector cosine + BM25 fused with weighted RRF."""
+    hits, _, _ = retrieve_debug(
+        question, store, embedder, top_k=top_k, min_score=min_score, alpha=alpha
+    )
+    return hits
+
+
+def retrieve_debug(
+    question: str,
+    store: VectorStore,
+    embedder: Embedder,
+    top_k: int | None = None,
+    min_score: float | None = None,
+    alpha: float | None = None,
+) -> tuple[list[tuple[Chunk, float]], list[dict[str, Any]], dict[str, Any]]:
+    """Like retrieve(), but also returns per-hit ranker contributions and
+    a debug dict describing how the ranking was produced."""
     top_k = config.TOP_K if top_k is None else top_k
     min_score = config.MIN_SCORE if min_score is None else min_score
+    if alpha is None:
+        alpha = config.HYBRID_ALPHA
+    alpha = min(1.0, max(0.0, alpha))
+
+    # Search a wider vector pool than top_k so fusion sees every candidate
+    # either ranker might surface; the relevance gate lives in hybrid_retrieve.
     query_vec = embedder.embed([question])[0]
-    return store.search(query_vec, top_k=top_k, min_score=min_score)
+    vector_hits = store.search(query_vec, top_k=max(top_k * 4, 10), min_score=0.0)
+
+    hits, contributions = hybrid_retrieve(
+        question,
+        vector_hits,
+        store.chunks,
+        top_k=top_k,
+        alpha=alpha,
+        rrf_k=config.RRF_K,
+        min_score=min_score,
+    )
+    debug = {
+        "hybrid_alpha": alpha,
+        "rrf_k": config.RRF_K,
+        "vector_pool_size": len(vector_hits),
+    }
+    return hits, contributions, debug
 
 
 def _best_sentences(chunk_text: str, keywords: list[str], limit: int = 2) -> list[str]:
@@ -52,8 +93,23 @@ def _best_sentences(chunk_text: str, keywords: list[str], limit: int = 2) -> lis
     return [s for _, s in scored[:limit]]
 
 
+def _contributing_rankers(contribution: dict[str, Any] | None) -> list[str]:
+    """Which rankers surfaced a hit (used in the debug response)."""
+    if not contribution:
+        return []
+    names = []
+    if contribution.get("vector_rank") is not None:
+        names.append("vector")
+    if contribution.get("bm25_rank") is not None:
+        names.append("bm25")
+    return names
+
+
 def fake_answer(
-    question: str, hits: list[tuple[Chunk, float]]
+    question: str,
+    hits: list[tuple[Chunk, float]],
+    contributions: list[dict[str, Any]] | None = None,
+    retrieval_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extractive offline answer: best matching sentences plus citations."""
     if not hits:
@@ -63,6 +119,7 @@ def fake_answer(
                 "Try rephrasing your question or ingest more documents."
             ),
             "citations": [],
+            "debug": retrieval_debug or {},
         }
     keywords = _keywords(question)
     picked: list[tuple[str, int]] = []  # (sentence, citation ref)
@@ -75,16 +132,20 @@ def fake_answer(
         # Fall back to the start of the best chunk if no sentence matched.
         picked = [(hits[0][0].text[:400].strip(), 1)]
 
-    citations = [
-        {
-            "ref": i + 1,
-            "source": chunk.source,
-            "page": chunk.page,
-            "score": round(score, 3),
-            "excerpt": chunk.text[:300].strip(),
-        }
-        for i, (chunk, score) in enumerate(hits)
-    ]
+    citations = []
+    for i, ((chunk, score), contrib) in enumerate(
+        zip(hits, contributions or [{}] * len(hits))
+    ):
+        citations.append(
+            {
+                "ref": i + 1,
+                "source": chunk.source,
+                "page": chunk.page,
+                "score": round(score, 3),
+                "excerpt": chunk.text[:300].strip(),
+                "rankers": _contributing_rankers(contrib),
+            }
+        )
     lines = ["Here is what I found in your documents:"]
     for sentence, ref in picked[:3]:
         lines.append(f"- {sentence} [{ref}]")
@@ -97,11 +158,18 @@ def fake_answer(
             for c in citations
         )
     )
-    return {"answer": "\n".join(lines), "citations": citations}
+    return {
+        "answer": "\n".join(lines),
+        "citations": citations,
+        "debug": retrieval_debug or {},
+    }
 
 
 def llm_answer(
-    question: str, hits: list[tuple[Chunk, float]]
+    question: str,
+    hits: list[tuple[Chunk, float]],
+    contributions: list[dict[str, Any]] | None = None,
+    retrieval_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Answer via an OpenAI-compatible chat completions endpoint."""
     import httpx
@@ -111,7 +179,9 @@ def llm_answer(
 
     context_blocks = []
     citations = []
-    for i, (chunk, score) in enumerate(hits, start=1):
+    for i, ((chunk, score), contrib) in enumerate(
+        zip(hits, contributions or [{}] * len(hits)), start=1
+    ):
         label = chunk.source + (f" (page {chunk.page})" if chunk.page else "")
         context_blocks.append(f"[{i}] {label}\n{chunk.text}")
         citations.append(
@@ -121,6 +191,7 @@ def llm_answer(
                 "page": chunk.page,
                 "score": round(score, 3),
                 "excerpt": chunk.text[:300].strip(),
+                "rankers": _contributing_rankers(contrib),
             }
         )
 
@@ -131,6 +202,7 @@ def llm_answer(
                 "Try rephrasing your question or ingest more documents."
             ),
             "citations": [],
+            "debug": retrieval_debug or {},
         }
 
     context = "\n\n".join(context_blocks)
@@ -157,7 +229,11 @@ def llm_answer(
     )
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
-    return {"answer": content, "citations": citations}
+    return {
+        "answer": content,
+        "citations": citations,
+        "debug": retrieval_debug or {},
+    }
 
 
 def answer_question(
@@ -165,8 +241,19 @@ def answer_question(
     store: VectorStore,
     embedder: Embedder,
     top_k: int | None = None,
+    alpha: float | None = None,
 ) -> dict[str, Any]:
-    hits = retrieve(question, store, embedder, top_k=top_k)
+    hits, contributions, debug = retrieve_debug(
+        question, store, embedder, top_k=top_k, alpha=alpha
+    )
+    debug["contributions"] = [
+        {"ref": i + 1, "source": chunk.source, **contrib}
+        for i, ((chunk, _), contrib) in enumerate(zip(hits, contributions))
+    ]
     if config.FAKE_LLM:
-        return fake_answer(question, hits)
-    return llm_answer(question, hits)
+        return fake_answer(
+            question, hits, contributions=contributions, retrieval_debug=debug
+        )
+    return llm_answer(
+        question, hits, contributions=contributions, retrieval_debug=debug
+    )

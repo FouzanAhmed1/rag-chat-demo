@@ -30,6 +30,16 @@ CHUNK_OVERLAP: int = _get_int("CHUNK_OVERLAP", 120)
 # Retrieval
 TOP_K: int = _get_int("TOP_K", 4)
 MIN_SCORE: float = _get_float("MIN_SCORE", 0.05)
+# Hybrid retrieval blend: 0.0 = pure BM25, 1.0 = pure vector, 0.5 = even RRF.
+HYBRID_ALPHA: float = _get_float("HYBRID_ALPHA", 0.5)
+# Reciprocal rank fusion constant.
+RRF_K: int = _get_int("RRF_K", 60)
+# Optional rerank stage after fusion: "heuristic" (default) or "none".
+RERANKER: str = os.environ.get("RERANKER", "heuristic").lower()
+# Conversation sessions: how many turns of history to keep, and how long an
+# idle session lives before it is swept.
+SESSION_MAX_TURNS: int = _get_int("SESSION_MAX_TURNS", 6)
+SESSION_TTL_SECONDS: int = _get_int("SESSION_TTL_SECONDS", 1800)
 
 # Offline hashing embedder
 EMBED_DIM: int = _get_int("EMBED_DIM", 1024)

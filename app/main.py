@@ -105,6 +105,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     citations: list[dict[str, Any]]
+    debug: dict[str, Any] | None = None
 
 
 @app.get("/health")
