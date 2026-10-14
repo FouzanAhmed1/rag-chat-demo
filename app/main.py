@@ -19,8 +19,8 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app import config
@@ -28,6 +28,7 @@ from app.chunking import chunk_text
 from app.embeddings import build_embedder
 from app.ingest import SUPPORTED_SUFFIXES, doc_id_for, load_document
 from app.rag import answer_question
+from app.sessions import sessions
 from app.store import Chunk, VectorStore
 
 store = VectorStore()
@@ -100,6 +101,7 @@ app = FastAPI(title="rag-chat-demo", lifespan=lifespan)
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     top_k: int | None = Field(default=None, ge=1, le=20)
+    session_id: str | None = Field(default=None, max_length=128)
 
 
 class ChatResponse(BaseModel):
@@ -148,8 +150,22 @@ async def ingest_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> dict[str, Any]:
-    return answer_question(req.question, store, embedder, top_k=req.top_k)
+def chat(
+    req: ChatRequest, x_session_id: str | None = Header(default=None)
+) -> dict[str, Any]:
+    session_id = req.session_id or x_session_id
+    history = sessions.history(session_id) if session_id else []
+    result = answer_question(
+        req.question,
+        store,
+        embedder,
+        top_k=req.top_k,
+        history=history,
+        session_id=session_id,
+    )
+    if session_id:
+        sessions.record(session_id, req.question, result["answer"])
+    return result
 
 
 @app.delete("/index")

@@ -15,6 +15,7 @@ from app.chunking import split_sentences
 from app.embeddings import Embedder
 from app.hybrid import hybrid_retrieve
 from app.rerank import get_reranker
+from app.sessions import Turn, history_prompt_block, rewrite_query
 from app.store import Chunk, VectorStore
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -101,6 +102,7 @@ def retrieve_debug(
         "hybrid_alpha": alpha,
         "rrf_k": config.RRF_K,
         "reranker": reranker,
+        "retrieval_query": question,
         "vector_pool_size": len(vector_hits),
     }
     return hits, contributions, debug
@@ -134,8 +136,14 @@ def fake_answer(
     hits: list[tuple[Chunk, float]],
     contributions: list[dict[str, Any]] | None = None,
     retrieval_debug: dict[str, Any] | None = None,
+    history: list[Turn] | None = None,
 ) -> dict[str, Any]:
-    """Extractive offline answer: best matching sentences plus citations."""
+    """Extractive offline answer: best matching sentences plus citations.
+
+    history is accepted so the session plumbing reaches the generator, and
+    is reported in the debug payload; the extractive text itself only ever
+    quotes the retrieved chunks.
+    """
     if not hits:
         return {
             "answer": (
@@ -194,6 +202,7 @@ def llm_answer(
     hits: list[tuple[Chunk, float]],
     contributions: list[dict[str, Any]] | None = None,
     retrieval_debug: dict[str, Any] | None = None,
+    history: list[Turn] | None = None,
 ) -> dict[str, Any]:
     """Answer via an OpenAI-compatible chat completions endpoint."""
     import httpx
@@ -235,6 +244,10 @@ def llm_answer(
         "Cite your sources with bracketed numbers like [1], [2] matching the "
         "context blocks. If the context does not contain the answer, say so."
     )
+    history_block = history_prompt_block(history or [])
+    user_content = f"Context:\n{context}\n\nQuestion: {question}"
+    if history_block:
+        user_content = f"{history_block}\n\n{user_content}"
     resp = httpx.post(
         f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
@@ -243,10 +256,7 @@ def llm_answer(
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": f"Context:\n{context}\n\nQuestion: {question}",
-                },
+                {"role": "user", "content": user_content},
             ],
         },
         timeout=120.0,
@@ -266,18 +276,35 @@ def answer_question(
     embedder: Embedder,
     top_k: int | None = None,
     alpha: float | None = None,
+    reranker: str | None = None,
+    history: list[Turn] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
+    history = history or []
+    retrieval_query = rewrite_query(question, history)
     hits, contributions, debug = retrieve_debug(
-        question, store, embedder, top_k=top_k, alpha=alpha
+        retrieval_query, store, embedder, top_k=top_k, alpha=alpha,
+        reranker=reranker,
     )
+    debug["retrieval_query"] = retrieval_query
+    debug["history_turns_used"] = len(history)
+    debug["session_id"] = session_id
     debug["contributions"] = [
         {"ref": i + 1, "source": chunk.source, **contrib}
         for i, ((chunk, _), contrib) in enumerate(zip(hits, contributions))
     ]
     if config.FAKE_LLM:
         return fake_answer(
-            question, hits, contributions=contributions, retrieval_debug=debug
+            question,
+            hits,
+            contributions=contributions,
+            retrieval_debug=debug,
+            history=history,
         )
     return llm_answer(
-        question, hits, contributions=contributions, retrieval_debug=debug
+        question,
+        hits,
+        contributions=contributions,
+        retrieval_debug=debug,
+        history=history,
     )
